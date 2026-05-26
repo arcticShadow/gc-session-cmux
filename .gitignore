@@ -1,0 +1,10 @@
+# State directory (runtime)
+/tmp/gc-session-cmux/
+${TMPDIR}gc-session-cmux/
+
+# macOS
+.DS_Store
+
+# Editor backups
+*~
+*.swp

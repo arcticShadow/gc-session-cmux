@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# gc-session-cmux — cmux (macOS terminal) session provider for Gas City.
+#
+# Implements the exec session provider protocol.
+# See: https://github.com/gastownhall/gascity/blob/main/docs/reference/exec-session-provider.md
+#
+# Workspace model: ONE cmux workspace per "rig". Sessions within the same rig
+# share a workspace. Each session name like "gastown.mayor" maps to workspace
+# "gc-gastown". Sessions without dots get their own workspace.
+#
+# Surface model (MVP): one default surface per workspace, shared by all rig
+# sessions. Future: surface-per-session via cmux splits.
+#
+# Dependencies: cmux CLI, jq, bash
+#
+# Usage:
+#   GC_SESSION=exec:/path/to/gc-session-cmux gc start <city>
+#   GC_SESSION=exec:gc-session-cmux gc start <city>  # if on PATH
+
+set -euo pipefail
+
+op="${1:?missing operation}"
+session_name="${2:-}"
+shift 2 || true
+
+# State directory
+STATE_DIR="${GC_EXEC_STATE_DIR:-${TMPDIR:-/tmp}/gc-session-cmux}"
+mkdir -p "$STATE_DIR"
+STATE_FILE="$STATE_DIR/workspaces.json"
+[ -f "$STATE_FILE" ] || echo '{"version":1,"workspaces":{}}' > "$STATE_FILE"
+
+# ── Helper: derive workspace key from session name ──
+# "gastown.mayor"  → "gastown"
+# "gastown"        → "gastown"
+# "my-agent"       → "my-agent"
+_derive_workspace_key() {
+    _name="$1"
+    if [[ "$_name" =~ \. ]]; then
+        echo "${_name%%.*}"
+    else
+        echo "$_name"
+    fi
+}
+
+# "gastown" → "gc-gastown"  (prefixed to avoid collisions with user workspaces)
+_mk_workspace_name() {
+    echo "gc-$1"
+}
+
+# ── CMUX helpers ──
+
+_cmux() {
+    cmux "$@" 2>/dev/null
+}
+
+_find_workspace() {
+    _ws_name="$1"
+    _json=$(_cmux list-workspaces --json)
+    [ -z "$_json" ] && return 1
+    echo "$_json" | jq --arg name "$_ws_name" -r '
+        if type == "array" then
+            .[] | select(.name == $name) | {name,ref:(.ref // .id // ""),uuid:(.uuid // .id // "")}
+        elif type == "object" then
+            if .name == $name then {name,ref:(.ref // .id // ""),uuid:(.uuid // .id // "")} else empty end
+        else empty end
+    '
+}
+
+_create_workspace() {
+    _ws_name="$1"
+    _cwd="${2:-}"
+    _extra_args=()
+    [ -n "$_cwd" ] && _extra_args+=("--cwd" "$_cwd")
+    _cmux new-workspace --name "$_ws_name" --focus false "${_extra_args[@]}"
+}
+
+_load_workspace_from_state() {
+    _key="$1"
+    jq --arg key "$_key" -r '.workspaces[$key] // empty' "$STATE_FILE" 2>/dev/null
+}
+
+_save_workspace_to_state() {
+    _key="$1"
+    _info="$2"
+    _tmp=$(mktemp)
+    jq --arg key "$_key" --argjson info "$_info" '.workspaces[$key] = $info' "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE"
+}
+
+# Ensure workspace exists; writes {"key":"...","name":"...","ref":"...","uuid":"..."} to stdout.
+_ensure_workspace() {
+    _key="$1"
+    _cwd="${2:-}"
+    _ws_name=$(_mk_workspace_name "$_key")
+
+    # 1. Try state file
+    _info=$(_load_workspace_from_state "$_key")
+    if [ -n "$_info" ]; then
+        _ref=$(echo "$_info" | jq -r '.ref // .uuid // empty')
+        if [ -n "$_ref" ]; then
+            echo "$_info"
+            return 0
+        fi
+    fi
+
+    # 2. Try cmux list (workspace may have been created in another gc instance)
+    _info=$(_find_workspace "$_ws_name") || _info=""
+    if [ -n "$_info" ]; then
+        _info=$(echo "$_info" | jq --arg key "$_key" '{key: $key} + .')
+        _save_workspace_to_state "$_key" "$_info"
+        echo "$_info"
+        return 0
+    fi
+
+    # 3. Create it
+    _info=$(_create_workspace "$_ws_name" "$_cwd") || {
+        echo "Failed to create cmux workspace '$_ws_name'" >&2
+        return 1
+    }
+    _info=$(_find_workspace "$_ws_name") || {
+        echo "Created workspace but could not find it in list" >&2
+        return 1
+    }
+    _info=$(echo "$_info" | jq --arg key "$_key" '{key: $key} + .')
+    _save_workspace_to_state "$_key" "$_info"
+
+    # Best-effort bead sync
+    _uuid=$(echo "$_info" | jq -r '.uuid // .ref // empty')
+    [ -n "$_uuid" ] && _sync_bead "$_key" "$_uuid"
+
+    echo "$_info"
+}
+
+# Best-effort: write workspace UUID as metadata to any gc:session bead matching this rig.
+_sync_bead() {
+    _key="$1"
+    _uuid="$2"
+    command -v gc >/dev/null 2>&1 || return 0
+
+    _beads=$(gc bd list --label gc:session --json --limit 50 2>/dev/null) || return 0
+    [ -z "$_beads" ] && return 0
+
+    echo "$_beads" | jq --arg key "$_key" -r '.[] | select(.metadata.session_name | startswith($key + "__") or . == $key) | .id' | while read -r _bead_id; do
+        [ -z "$_bead_id" ] && continue
+        gc bd update "$_bead_id" --set-metadata "gc.rig_workspace_uuid=$_uuid" 2>/dev/null || true
+        gc bd update "$_bead_id" --set-metadata "gc.rig_workspace_name=$_key" 2>/dev/null || true
+    done
+}
+
+# ── Operations ──
+
+case "$op" in
+  start)
+    if [ -z "$session_name" ]; then
+        echo "start: missing session name" >&2
+        exit 1
+    fi
+
+    config=$(cat)
+    work_dir=$(echo "$config" | jq -r '.work_dir // empty')
+    cmd=$(echo "$config" | jq -r '.command // empty')
+    env_json=$(echo "$config" | jq -r '.env // {} | to_entries[] | "export \"\(.key)=\(.value)\""' 2>/dev/null || true)
+    pre_start=$(echo "$config" | jq -r '.pre_start // [] | .[]' 2>/dev/null || true)
+    session_setup=$(echo "$config" | jq -r '.session_setup // [] | .[]' 2>/dev/null || true)
+    session_setup_script=$(echo "$config" | jq -r '.session_setup_script // empty' 2>/dev/null || true)
+    nudge_text=$(echo "$config" | jq -r '.nudge // empty')
+
+    ws_key=$(_derive_workspace_key "$session_name")
+
+    # pre_start: run setup on controller filesystem before session creation
+    if [ -n "$pre_start" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            (sh -c "$line") || echo "pre_start warning: $line" >&2
+        done <<< "$pre_start"
+    fi
+
+    ws_info=$(_ensure_workspace "$ws_key" "$work_dir") || {
+        echo "Failed to ensure workspace for rig '$ws_key'" >&2
+        exit 1
+    }
+    ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+    if [ -z "$ws_ref" ]; then
+        echo "Workspace has no ref/uuid" >&2
+        exit 1
+    fi
+
+    # Build wrapper script
+    wrapper="$STATE_DIR/${session_name}.wrapper.sh"
+    {
+        echo '#!/bin/bash'
+        echo 'set -euo pipefail'
+        if [ -n "$env_json" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && echo "$line"
+            done <<< "$env_json"
+        fi
+        if [ -n "$work_dir" ]; then
+            echo "cd \"$work_dir\""
+        fi
+        if [ -n "$session_setup" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                echo "$line"
+            done <<< "$session_setup"
+        fi
+        if [ -n "$session_setup_script" ] && [ -f "$session_setup_script" ]; then
+            echo "bash '$session_setup_script'"
+        fi
+        if [ -n "$cmd" ]; then
+            echo "exec $cmd"
+        else
+            echo 'exec "$SHELL"'
+        fi
+    } > "$wrapper"
+    chmod +x "$wrapper"
+
+    # Give workspace a moment to finish creating
+    sleep 0.3
+
+    # Send the wrapper invocation into the workspace.
+    # Using \n for newline to trigger execution.
+    _cmux send --workspace "$ws_ref" "bash '$wrapper'\\n" 2>/dev/null || {
+        sleep 1
+        _cmux send --workspace "$ws_ref" "bash '$wrapper'\\n" 2>/dev/null || true
+    }
+
+    # Handle nudge text if provided
+    if [ -n "$nudge_text" ]; then
+        sleep 0.5
+        # Escape newlines for cmux send
+        escaped=$(printf '%s' "$nudge_text" | sed 's/\\n/\\n/g; s/\n/\\n/g')
+        _cmux send --workspace "$ws_ref" "$escaped\\n" 2>/dev/null || true
+    fi
+    ;;
+
+  stop)
+    # Shared workspace: don't close the workspace — other sessions in the
+    # same rig may still be using it. Just clean up wrapper.
+    rm -f "$STATE_DIR/${session_name}.wrapper.sh"
+
+    # Best-effort interrupt (soft stop)
+    ws_key=$(_derive_workspace_key "$session_name")
+    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+    if [ -n "$ws_info" ]; then
+        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+        [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+    fi
+    ;;
+
+  interrupt)
+    [ -z "$session_name" ] && exit 0
+    ws_key=$(_derive_workspace_key "$session_name")
+    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+    if [ -n "$ws_info" ]; then
+        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+        [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+    fi
+    ;;
+
+  is-running)
+    if [ -z "$session_name" ]; then
+        echo "false"
+        exit 0
+    fi
+    ws_key=$(_derive_workspace_key "$session_name")
+    ws_info=$(_load_workspace_from_state "$ws_key")
+    if [ -n "$ws_info" ]; then
+        ws_name=$(_mk_workspace_name "$ws_key")
+      if _find_workspace "$ws_name" >/dev/null 2>&1; then
+            echo "true"
+      else
+            echo "false"
+      fi
+    else
+        echo "false"
+    fi
+    ;;
+
+  attach)
+    if [ -z "$session_name" ]; then
+        echo "attach: missing session name" >&2
+        exit 1
+    fi
+    ws_key=$(_derive_workspace_key "$session_name")
+    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+    if [ -z "$ws_info" ]; then
+        ws_info=$(_find_workspace "$(_mk_workspace_name "$ws_key")") || ws_info=""
+    fi
+    if [ -z "$ws_info" ]; then
+        echo "No cmux workspace found for '$session_name'" >&2
+        exit 1
+    fi
+    ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+    _cmux select-workspace "$ws_ref" 2>/dev/null || true
+    echo "CMUX workspace: $(_mk_workspace_name "$ws_key") (ref: $ws_ref)"
+    echo "Switch to the cmux window to interact."
+    ;;
+
+  process-alive)
+    if [ -z "$session_name" ]; then
+        echo "true"
+        exit 0
+    fi
+
+    process_names=()
+    while IFS= read -r pname; do
+        [ -n "$pname" ] && process_names+=("$pname")
+    done
+
+    if [ ${#process_names[@]} -eq 0 ]; then
+        echo "true"
+        exit 0
+    fi
+
+    found=false
+    for pname in "${process_names[@]}"; do
+        if pgrep -f "$pname" >/dev/null 2>&1; then
+            found=true
+        break
+        fi
+    done
+
+    if [ "$found" = true ]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+    ;;
+
+  nudge)
+    [ -z "$session_name" ] && exit 0
+    msg=$(cat)
+    ws_key=$(_derive_workspace_key "$session_name")
+    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+    if [ -n "$ws_info" ]; then
+        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+        [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" "$msg\\n" 2>/dev/null || true
+    fi
+    ;;
+
+  set-meta)
+    key="${1:?set-meta: missing key}"
+    value=$(cat)
+    echo -n "$value" > "$STATE_DIR/${session_name}.meta.${key}"
+    ;;
+
+  get-meta)
+    key="${1:?get-meta: missing key}"
+    meta_file="$STATE_DIR/${session_name}.meta.${key}"
+    [ -f "$meta_file" ] && cat "$meta_file"
+    # Empty stdout = not set (per protocol).
+    ;;
+
+  remove-meta)
+    key="${1:?remove-meta: missing key}"
+    rm -f "$STATE_DIR/${session_name}.meta.${key}"
+    ;;
+
+  peek)
+    lines="${1:-0}"
+    [ -z "$session_name" ] && exit 0
+    ws_key=$(_derive_workspace_key "$session_name")
+    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+    [ -z "$ws_info" ] && exit 0
+    ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+    [ -z "$ws_ref" ] && exit 0
+
+    if [ "$lines" -gt 0 ] 2>/dev/null; then
+        _cmux read-screen --workspace "$ws_ref" --scrollback --lines "$lines" 2>/dev/null || true
+    else
+        _cmux read-screen --workspace "$ws_ref" --scrollback 2>/dev/null || true
+    fi
+    ;;
+
+  list-running)
+    prefix="${session_name:-}"
+    json=$(_cmux list-workspaces --json 2>/dev/null) || {
+        exit 0
+    }
+    [ -z "$json" ] && exit 0
+
+    echo "$json" | jq --arg prefix "$prefix" -r '
+        if type == "array" then .[] elif type == "object" then . else empty end |
+        select(.name | startswith("gc-")) |
+        .name |
+        ltrimstr("gc-") |
+        if $prefix == "" or startswith($prefix) then . else empty end
+    '
+    exit 0
+    ;;
+
+  get-last-activity)
+    # CMUX does not expose per-workspace activity timestamps via CLI.
+    # Empty stdout = unsupported (per protocol).
+    ;;
+
+  copy-to)
+    src="${1:-}"
+    rel_dst="${2:-}"
+    [ -z "$session_name" ] || [ -z "$src" ] && exit 0
+
+    ws_key=$(_derive_workspace_key "$session_name")
+    wrapper="$STATE_DIR/${session_name}.wrapper.sh"
+    work_dir=""
+    if [ -f "$wrapper" ]; then
+        # Extract cd line:  cd "/path/to/dir"
+        work_dir=$(grep '^cd ' "$wrapper" | head -1 | sed 's/^cd "//;s/"$//')
+    fi
+    [ -z "$work_dir" ] && exit 0
+
+    dst="$work_dir"
+    [ -n "$rel_dst" ] && dst="$work_dir/$rel_dst"
+
+    if [ -d "$src" ]; then
+        mkdir -p "$dst"
+        cp -r "$src/." "$dst/" 2>/dev/null || true
+    elif [ -f "$src" ]; then
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst" 2>/dev/null || true
+    fi
+    ;;
+
+  *)
+    exit 2
+    ;;
+esac
