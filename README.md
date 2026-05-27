@@ -14,11 +14,34 @@ Sessions are grouped by **rig**. A session named `gastown.mayor` shares a worksp
 
 This design matches the Gas Town mental model: one terminal workspace per project, with each agent as a surface (or in the future, a split) within it.
 
-## Dependencies
+## Prerequisites
 
-- [cmux](https://cmux.com) CLI installed and the cmux app running
-- `jq`
-- `bash`
+- **cmux** — macOS terminal app from [cmux.com](https://cmux.com). Install and keep the app running.
+- **jq** — `brew install jq`
+- **bash** — macOS ships with this
+
+### cmux socket configuration
+
+The script talks to cmux over its Unix socket. If you use socket authentication, the provider needs access. The simplest setup:
+
+1. Open **cmux → Settings → Advanced**
+2. Set **Socket Access** to **Allow All Incoming Connections** (`CMUX_SOCKET_MODE=allowAll`)
+
+Or use a password and set `CMUX_SOCKET_PASSWORD` / `--password`.
+
+### CMUX binary path
+
+cmux ships inside the macOS `.app` bundle at:
+
+```
+/Applications/cmux.app/Contents/Resources/bin/cmux
+```
+
+The provider auto-detects this path. If you've installed cmux elsewhere, override:
+
+```bash
+export GC_CMUX_BIN=/path/to/cmux
+```
 
 ## Installation
 
@@ -37,7 +60,7 @@ export GC_SESSION=exec:/path/to/gc-session-cmux
 ## Usage
 
 ```bash
-# Set the session provider
+# Set the session provider (and optionally the binary path)
 export GC_SESSION=exec:gc-session-cmux
 
 # Start your city

@@ -47,21 +47,44 @@ _mk_workspace_name() {
     echo "gc-$1"
 }
 
+# ── CMUX binary detection ──
+# cmux ships inside the macOS .app bundle. Auto-detect that path, or fall
+# back to PATH lookup. Override via GC_CMUX_BIN.
+CMUX_BIN="${GC_CMUX_BIN:-$(which cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)}"
+
+if [ ! -x "$CMUX_BIN" ]; then
+    echo "gc-session-cmux: cmux binary not found at $CMUX_BIN" >&2
+    echo "  Install cmux from https://cmux.com or set GC_CMUX_BIN" >&2
+    exit 1
+fi
+
+# Quick connectivity check so we fail fast with a helpful message.
+if ! "$CMUX_BIN" ping >/dev/null 2>&1; then
+    echo "gc-session-cmux: cmux is not responding" >&2
+    echo "  Ensure cmux.app is running and the socket is accessible." >&2
+    echo "  If you use socket authentication, set CMUX_SOCKET_MODE=allowAll" >&2
+    echo "  in cmux Settings > Advanced, or provide --password / CMUX_SOCKET_PASSWORD." >&2
+    exit 1
+fi
+
 # ── CMUX helpers ──
 
 _cmux() {
-    cmux "$@" 2>/dev/null
+    "$CMUX_BIN" "$@" 2>/dev/null
 }
 
 _find_workspace() {
     _ws_name="$1"
     _json=$(_cmux list-workspaces --json)
     [ -z "$_json" ] && return 1
+    # cmux list-workspaces --json returns {"window_ref":...,"workspaces":[...]}
+    # or in some versions a plain array.  Handle both.
     echo "$_json" | jq --arg name "$_ws_name" -r '
-        if type == "array" then
-            .[] | select(.name == $name) | {name,ref:(.ref // .id // ""),uuid:(.uuid // .id // "")}
-        elif type == "object" then
-            if .name == $name then {name,ref:(.ref // .id // ""),uuid:(.uuid // .id // "")} else empty end
+        (.workspaces // .) as $list |
+        if ($list | type) == "array" then
+            $list[] | select(.title == $name) | {name:.title,ref:(.ref // .id // ""),uuid:(.uuid // .id // "")}
+        elif ($list | type) == "object" then
+            if $list.title == $name then {name:$list.title,ref:($list.ref // $list.id // ""),uuid:($list.uuid // $list.id // "")} else empty end
         else empty end
     '
 }
@@ -379,10 +402,10 @@ case "$op" in
     }
     [ -z "$json" ] && exit 0
 
-    echo "$json" | jq --arg prefix "$prefix" -r '
-        if type == "array" then .[] elif type == "object" then . else empty end |
-        select(.name | startswith("gc-")) |
-        .name |
+    echo "$json" | jq --arg prefix "$prefix" -r '(.workspaces // .) as $list |
+        if ($list | type) == "array" then $list[] elif ($list | type) == "object" then $list else empty end |
+        select(.title | startswith("gc-")) |
+        .title |
         ltrimstr("gc-") |
         if $prefix == "" or startswith($prefix) then . else empty end
     '
