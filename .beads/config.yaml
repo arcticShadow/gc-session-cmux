@@ -1,0 +1,11 @@
+issue_prefix: sc
+issue-prefix: sc
+dolt.auto-start: false
+dolt:
+  disable-event-flush: true
+export.auto: false
+backup.enabled: false
+gc.endpoint_origin: inherited_city
+gc.endpoint_status: verified
+
+sync.remote: "git+ssh://git@github.com/arcticShadow/gc-session-cmux.git"
