@@ -257,8 +257,7 @@ case "$op" in
     ;;
 
   stop)
-    # Shared workspace: don't close the workspace — other sessions in the
-    # same rig may still be using it. Just clean up wrapper.
+    # Remove wrapper for this session before checking for siblings.
     rm -f "$STATE_DIR/${session_name}.wrapper.sh"
 
     # Best-effort interrupt (soft stop)
@@ -267,6 +266,17 @@ case "$op" in
     if [ -n "$ws_info" ]; then
         ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
         [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+    fi
+
+    # Close the cmux workspace when the last session in this rig stops.
+    # Sibling wrappers exist either as "${ws_key}.wrapper.sh" (standalone)
+    # or "${ws_key}.*.wrapper.sh" (dot-separated session names).
+    sibling_count=$(find "$STATE_DIR" -maxdepth 1 \( -name "${ws_key}.wrapper.sh" -o -name "${ws_key}.*.wrapper.sh" \) 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$sibling_count" -eq 0 ] && [ -n "$ws_info" ]; then
+        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+        [ -n "$ws_ref" ] && _cmux close-workspace --workspace "$ws_ref" 2>/dev/null || true
+        _tmp=$(mktemp)
+        jq --arg key "$ws_key" 'del(.workspaces[$key])' "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE" || rm -f "$_tmp"
     fi
     ;;
 
