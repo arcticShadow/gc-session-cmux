@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # gc-session-cmux — cmux (macOS terminal) session provider for Gas City.
 #
-# Implements the exec session provider protocol.
-# See: https://github.com/gastownhall/gascity/blob/main/docs/reference/exec-session-provider.md
+# Implements the exec session provider protocol:
+# https://docs.gascityhall.com/reference/exec-session-provider
 #
 # Workspace model: ONE cmux workspace per "rig". Sessions within the same rig
 # share a workspace. Each session name like "gastown.mayor" maps to workspace
@@ -23,13 +23,14 @@ op="${1:?missing operation}"
 session_name="${2:-}"
 shift 2 || true
 
-# State directory
+# ── State directory ──
+# Honor GC_EXEC_STATE_DIR per spec; otherwise default under $TMPDIR.
 STATE_DIR="${GC_EXEC_STATE_DIR:-${TMPDIR:-/tmp}/gc-session-cmux}"
 mkdir -p "$STATE_DIR"
 STATE_FILE="$STATE_DIR/workspaces.json"
 [ -f "$STATE_FILE" ] || echo '{"version":1,"workspaces":{}}' > "$STATE_FILE"
 
-# ── Helper: derive workspace key from session name ──
+# ── Workspace key helpers ──
 # "gastown.mayor"  → "gastown"
 # "gastown"        → "gastown"
 # "my-agent"       → "my-agent"
@@ -50,22 +51,38 @@ _mk_workspace_name() {
 # ── CMUX binary detection ──
 # cmux ships inside the macOS .app bundle. Auto-detect that path, or fall
 # back to PATH lookup. Override via GC_CMUX_BIN.
-CMUX_BIN="${GC_CMUX_BIN:-$(which cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)}"
+CMUX_BIN="${GC_CMUX_BIN:-$(command -v cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)}"
 
-if [ ! -x "$CMUX_BIN" ]; then
-    echo "gc-session-cmux: cmux binary not found at $CMUX_BIN" >&2
-    echo "  Install cmux from https://cmux.com or set GC_CMUX_BIN" >&2
-    exit 1
-fi
+# Per spec, ops must remain idempotent and degrade gracefully when their backend
+# is unreachable. We split cmux availability into two checks:
+#
+#   _cmux_available  — quiet predicate; returns 0/1 without printing/exiting.
+#                      Use in ops that can degrade (stop, interrupt, nudge,
+#                      is-running, list-running).
+#
+#   _cmux_require    — exits 1 with a helpful message. Use in ops that
+#                      cannot proceed without cmux (start, attach, peek).
+#
+# File-only ops (set-meta/get-meta/remove-meta/get-last-activity) bypass
+# cmux entirely.
+_cmux_available() {
+    [ -x "$CMUX_BIN" ] && "$CMUX_BIN" ping >/dev/null 2>&1
+}
 
-# Quick connectivity check so we fail fast with a helpful message.
-if ! "$CMUX_BIN" ping >/dev/null 2>&1; then
-    echo "gc-session-cmux: cmux is not responding" >&2
-    echo "  Ensure cmux.app is running and the socket is accessible." >&2
-    echo "  If you use socket authentication, set CMUX_SOCKET_MODE=allowAll" >&2
-    echo "  in cmux Settings > Advanced, or provide --password / CMUX_SOCKET_PASSWORD." >&2
-    exit 1
-fi
+_cmux_require() {
+    if [ ! -x "$CMUX_BIN" ]; then
+        echo "gc-session-cmux: cmux binary not found at $CMUX_BIN" >&2
+        echo "  Install cmux from https://cmux.com or set GC_CMUX_BIN" >&2
+        exit 1
+    fi
+    if ! "$CMUX_BIN" ping >/dev/null 2>&1; then
+        echo "gc-session-cmux: cmux is not responding" >&2
+        echo "  Ensure cmux.app is running and the socket is accessible." >&2
+        echo "  If you use socket authentication, set CMUX_SOCKET_MODE=allowAll" >&2
+        echo "  in cmux Settings > Advanced, or provide --password / CMUX_SOCKET_PASSWORD." >&2
+        exit 1
+    fi
+}
 
 # ── CMUX helpers ──
 
@@ -109,50 +126,6 @@ _save_workspace_to_state() {
     jq --arg key "$_key" --argjson info "$_info" '.workspaces[$key] = $info' "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE"
 }
 
-# Ensure workspace exists; writes {"key":"...","name":"...","ref":"...","uuid":"..."} to stdout.
-_ensure_workspace() {
-    _key="$1"
-    _cwd="${2:-}"
-    _ws_name=$(_mk_workspace_name "$_key")
-
-    # 1. Try state file
-    _info=$(_load_workspace_from_state "$_key")
-    if [ -n "$_info" ]; then
-        _ref=$(echo "$_info" | jq -r '.ref // .uuid // empty')
-        if [ -n "$_ref" ]; then
-            echo "$_info"
-            return 0
-        fi
-    fi
-
-    # 2. Try cmux list (workspace may have been created in another gc instance)
-    _info=$(_find_workspace "$_ws_name") || _info=""
-    if [ -n "$_info" ]; then
-        _info=$(echo "$_info" | jq --arg key "$_key" '{key: $key} + .')
-        _save_workspace_to_state "$_key" "$_info"
-        echo "$_info"
-        return 0
-    fi
-
-    # 3. Create it
-    _info=$(_create_workspace "$_ws_name" "$_cwd") || {
-        echo "Failed to create cmux workspace '$_ws_name'" >&2
-        return 1
-    }
-    _info=$(_find_workspace "$_ws_name") || {
-        echo "Created workspace but could not find it in list" >&2
-        return 1
-    }
-    _info=$(echo "$_info" | jq --arg key "$_key" '{key: $key} + .')
-    _save_workspace_to_state "$_key" "$_info"
-
-    # Best-effort bead sync
-    _uuid=$(echo "$_info" | jq -r '.uuid // .ref // empty')
-    [ -n "$_uuid" ] && _sync_bead "$_key" "$_uuid"
-
-    echo "$_info"
-}
-
 # Best-effort: write workspace UUID as metadata to any gc:session bead matching this rig.
 _sync_bead() {
     _key="$1"
@@ -169,6 +142,23 @@ _sync_bead() {
     done
 }
 
+# Wrapper-file path for a session — wrappers are the canonical
+# "this session has been started, not yet stopped" marker on disk.
+_wrapper_path() {
+    echo "$STATE_DIR/${1}.wrapper.sh"
+}
+
+# Returns 0 if the session has a wrapper file, cmux is reachable, and the
+# session's workspace exists in cmux. Used by is-running and process-alive.
+_session_appears_live() {
+    _sal_name="$1"
+    [ -f "$(_wrapper_path "$_sal_name")" ] || return 1
+    _cmux_available || return 1
+    _sal_ws_key=$(_derive_workspace_key "$_sal_name")
+    _sal_ws_name=$(_mk_workspace_name "$_sal_ws_key")
+    _find_workspace "$_sal_ws_name" >/dev/null 2>&1 || return 1
+}
+
 # ── Operations ──
 
 case "$op" in
@@ -177,6 +167,7 @@ case "$op" in
         echo "start: missing session name" >&2
         exit 1
     fi
+    _cmux_require
 
     config=$(cat)
     work_dir=$(echo "$config" | jq -r '.work_dir // empty')
@@ -186,10 +177,16 @@ case "$op" in
     session_setup=$(echo "$config" | jq -r '.session_setup // [] | .[]' 2>/dev/null || true)
     session_setup_script=$(echo "$config" | jq -r '.session_setup_script // empty' 2>/dev/null || true)
     nudge_text=$(echo "$config" | jq -r '.nudge // empty')
+    # lifecycle: "one_shot" hints the command exits after handling its prompt.
+    # We don't need to alter behavior for cmux — the workspace persists either
+    # way — but we record it so is-running can avoid restart loops if needed.
+    lifecycle=$(echo "$config" | jq -r '.lifecycle // empty')
 
     ws_key=$(_derive_workspace_key "$session_name")
+    ws_name=$(_mk_workspace_name "$ws_key")
 
-    # pre_start: run setup on controller filesystem before session creation
+    # pre_start: run setup on controller filesystem before session creation.
+    # Per spec, per-command failure is non-fatal — warn on stderr, don't abort.
     if [ -n "$pre_start" ]; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -197,18 +194,11 @@ case "$op" in
         done <<< "$pre_start"
     fi
 
-    ws_info=$(_ensure_workspace "$ws_key" "$work_dir") || {
-        echo "Failed to ensure workspace for rig '$ws_key'" >&2
-        exit 1
-    }
-    ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
-    if [ -z "$ws_ref" ]; then
-        echo "Workspace has no ref/uuid" >&2
-        exit 1
-    fi
-
-    # Build wrapper script
-    wrapper="$STATE_DIR/${session_name}.wrapper.sh"
+    # Build wrapper script BEFORE touching the workspace so we can launch it
+    # via cmux's --command (live shell from the start). This avoids the race
+    # where cmux auto-closes an empty workspace before 'send' fires, and the
+    # dead-surface problem where 'send' targets a closed pty.
+    wrapper=$(_wrapper_path "$session_name")
     {
         echo '#!/bin/bash'
         echo 'set -euo pipefail'
@@ -220,14 +210,16 @@ case "$op" in
         if [ -n "$work_dir" ]; then
             echo "cd \"$work_dir\""
         fi
+        # session_setup runs inside the session environment. Per spec these
+        # are non-fatal (warn but continue) — wrap each in a continuation.
         if [ -n "$session_setup" ]; then
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
-                echo "$line"
+                echo "$line || echo 'session_setup warning: $line' >&2"
             done <<< "$session_setup"
         fi
         if [ -n "$session_setup_script" ] && [ -f "$session_setup_script" ]; then
-            echo "bash '$session_setup_script'"
+            echo "bash '$session_setup_script' || echo 'session_setup_script warning' >&2"
         fi
         if [ -n "$cmd" ]; then
             echo "exec $cmd"
@@ -237,63 +229,134 @@ case "$op" in
     } > "$wrapper"
     chmod +x "$wrapper"
 
-    # Give workspace a moment to finish creating
-    sleep 0.3
+    # Record lifecycle if provided — informational for is-running.
+    if [ -n "$lifecycle" ]; then
+        echo -n "$lifecycle" > "$STATE_DIR/${session_name}.lifecycle"
+    else
+        rm -f "$STATE_DIR/${session_name}.lifecycle"
+    fi
 
-    # Send the wrapper invocation into the workspace.
-    # Using \n for newline to trigger execution.
-    _cmux send --workspace "$ws_ref" "bash '$wrapper'\\n" 2>/dev/null || {
-        sleep 1
-        _cmux send --workspace "$ws_ref" "bash '$wrapper'\\n" 2>/dev/null || true
-    }
+    # Check if a live workspace already exists for this key.
+    _existing_info=$(_load_workspace_from_state "$ws_key")
+    _workspace_live=false
+    if [ -n "$_existing_info" ]; then
+        _existing_ref=$(echo "$_existing_info" | jq -r '.ref // .uuid // empty')
+        if [ -n "$_existing_ref" ] && _find_workspace "$ws_name" >/dev/null 2>&1; then
+            _workspace_live=true
+        fi
+    fi
+
+    if [ "$_workspace_live" = "true" ]; then
+        # Existing workspace: respawn its surface directly with the wrapper command.
+        # Handles the case where the previous command exited (killing the pty).
+        ws_ref="$_existing_ref"
+        if ! _cmux respawn-pane --workspace "$ws_ref" --command "bash '$wrapper'" 2>/dev/null; then
+            # respawn-pane failed (e.g. no pane ref available) — fall back to
+            # creating a fresh surface and sending.
+            _cmux new-surface --type terminal --workspace "$ws_ref" --focus false 2>/dev/null || true
+            sleep 0.5
+            _cmux send --workspace "$ws_ref" "bash '$wrapper'\\n" 2>/dev/null || true
+        fi
+    else
+        # New (or lost) workspace: create with the wrapper as the launch command
+        # so cmux starts the process immediately and won't auto-close.
+        _cmux new-workspace --name "$ws_name" --command "bash '$wrapper'" \
+            ${work_dir:+--cwd "$work_dir"} --focus false 2>/dev/null || {
+            echo "Failed to create cmux workspace '$ws_name'" >&2
+            exit 1
+        }
+        _new_info=$(_find_workspace "$ws_name") || {
+            echo "Created workspace but could not find it in list" >&2
+            exit 1
+        }
+        _new_info=$(echo "$_new_info" | jq --arg key "$ws_key" '{key: $key} + .')
+        _save_workspace_to_state "$ws_key" "$_new_info"
+        ws_ref=$(echo "$_new_info" | jq -r '.ref // .uuid // empty')
+        _uuid=$(echo "$_new_info" | jq -r '.uuid // .ref // empty')
+        [ -n "$_uuid" ] && _sync_bead "$ws_key" "$_uuid"
+    fi
+
+    if [ -z "$ws_ref" ]; then
+        echo "Workspace has no ref/uuid" >&2
+        exit 1
+    fi
 
     # Handle nudge text if provided
     if [ -n "$nudge_text" ]; then
         sleep 0.5
-        # Escape newlines for cmux send
         escaped=$(printf '%s' "$nudge_text" | sed 's/\\n/\\n/g; s/\n/\\n/g')
         _cmux send --workspace "$ws_ref" "$escaped\\n" 2>/dev/null || true
     fi
     ;;
 
   stop)
-    # Shared workspace: don't close the workspace — other sessions in the
-    # same rig may still be using it. Just clean up wrapper.
-    rm -f "$STATE_DIR/${session_name}.wrapper.sh"
+    # Per spec: stop must succeed (exit 0) even if the session doesn't exist.
+    # Clean up local wrapper unconditionally; best-effort Ctrl+C if cmux is up.
+    rm -f "$(_wrapper_path "$session_name")"
+    rm -f "$STATE_DIR/${session_name}.lifecycle"
 
-    # Best-effort interrupt (soft stop)
-    ws_key=$(_derive_workspace_key "$session_name")
-    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
-    if [ -n "$ws_info" ]; then
-        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
-        [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+    if [ -n "$session_name" ] && _cmux_available; then
+        ws_key=$(_derive_workspace_key "$session_name")
+        ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+        if [ -n "$ws_info" ]; then
+            ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+            [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+        fi
+
+        # Close the workspace if this was the last session in the rig.
+        # The wrapper file for this session was already removed above, so any
+        # remaining .wrapper.sh files for the same ws_key belong to siblings.
+        _sibling_running=false
+        for _f in "$STATE_DIR"/*.wrapper.sh; do
+            [ -f "$_f" ] || continue
+            _sname=$(basename "$_f" .wrapper.sh)
+            if [ "$(_derive_workspace_key "$_sname")" = "$ws_key" ]; then
+                _sibling_running=true
+                break
+            fi
+        done
+
+        if [ "$_sibling_running" = "false" ] && [ -n "${ws_info:-}" ]; then
+            _close_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+            [ -n "$_close_ref" ] && _cmux close-workspace --workspace "$_close_ref" 2>/dev/null || true
+            _tmp=$(mktemp)
+            jq --arg key "$ws_key" 'del(.workspaces[$key])' "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE"
+        fi
     fi
+    exit 0
     ;;
 
   interrupt)
+    # Per spec: best-effort; exit 0 even if session doesn't exist.
     [ -z "$session_name" ] && exit 0
-    ws_key=$(_derive_workspace_key "$session_name")
-    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
-    if [ -n "$ws_info" ]; then
-        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
-        [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+    if _cmux_available; then
+        ws_key=$(_derive_workspace_key "$session_name")
+        ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+        if [ -n "$ws_info" ]; then
+            ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+            [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" $'\x03' 2>/dev/null || true
+        fi
     fi
+    exit 0
     ;;
 
   is-running)
+    # Per spec: stdout is "true" or "false". A graceful "false" when cmux is
+    # unreachable is correct — no session can be running without cmux.
     if [ -z "$session_name" ]; then
         echo "false"
         exit 0
     fi
-    ws_key=$(_derive_workspace_key "$session_name")
-    ws_info=$(_load_workspace_from_state "$ws_key")
-    if [ -n "$ws_info" ]; then
+    if _session_appears_live "$session_name"; then
+        # Repair missing state so subsequent operations work.
+        ws_key=$(_derive_workspace_key "$session_name")
         ws_name=$(_mk_workspace_name "$ws_key")
-      if _find_workspace "$ws_name" >/dev/null 2>&1; then
-            echo "true"
-      else
-            echo "false"
-      fi
+        if [ -z "$(_load_workspace_from_state "$ws_key")" ]; then
+            _recovered=$(_find_workspace "$ws_name")
+            _recovered=$(echo "$_recovered" | jq --arg key "$ws_key" '{key: $key} + .')
+            _save_workspace_to_state "$ws_key" "$_recovered"
+        fi
+        echo "true"
     else
         echo "false"
     fi
@@ -304,33 +367,75 @@ case "$op" in
         echo "attach: missing session name" >&2
         exit 1
     fi
+    _cmux_require
+
     ws_key=$(_derive_workspace_key "$session_name")
-    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+    ws_name=$(_mk_workspace_name "$ws_key")
+
+    # Always validate against live cmux state — cached refs go stale when workspaces are closed.
+    ws_info=$(_find_workspace "$ws_name") || ws_info=""
+
     if [ -z "$ws_info" ]; then
-        ws_info=$(_find_workspace "$(_mk_workspace_name "$ws_key")") || ws_info=""
+        # Workspace is gone — reopen it. Best-effort: restore cwd from the wrapper.
+        _attach_cwd=""
+        _wrapper=$(_wrapper_path "$session_name")
+        if [ -f "$_wrapper" ]; then
+            _attach_cwd=$(grep '^cd ' "$_wrapper" | head -1 | sed 's/^cd "//;s/"$//')
+        fi
+        _create_workspace "$ws_name" "$_attach_cwd" || {
+            echo "gc-session-cmux: failed to create cmux workspace '$ws_name'" >&2
+            exit 1
+        }
+        ws_info=$(_find_workspace "$ws_name") || ws_info=""
+        if [ -z "$ws_info" ]; then
+            echo "gc-session-cmux: could not find workspace '$ws_name' after creation" >&2
+            exit 1
+        fi
+        ws_info=$(echo "$ws_info" | jq --arg key "$ws_key" '{key: $key} + .')
+        _save_workspace_to_state "$ws_key" "$ws_info"
     fi
-    if [ -z "$ws_info" ]; then
-        echo "No cmux workspace found for '$session_name'" >&2
+
+    ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+    if [ -z "$ws_ref" ]; then
+        echo "gc-session-cmux: workspace '$ws_name' has no ref/uuid" >&2
         exit 1
     fi
-    ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+
     _cmux select-workspace "$ws_ref" 2>/dev/null || true
-    echo "CMUX workspace: $(_mk_workspace_name "$ws_key") (ref: $ws_ref)"
+    echo "CMUX workspace: $ws_name (ref: $ws_ref)"
     echo "Switch to the cmux window to interact."
     ;;
 
   process-alive)
+    # Per spec: stdin contains process names, one per line; stdout is true/false.
+    # File operation only — does NOT require cmux for the pgrep path.
     if [ -z "$session_name" ]; then
-        echo "true"
+        echo "false"
         exit 0
     fi
 
     process_names=()
-    while IFS= read -r pname; do
+    # `read -r` returns non-zero when it reads a partial final line (no
+    # trailing newline). Consume that too so callers don't have to ensure a
+    # trailing newline.
+    while IFS= read -r pname || [ -n "$pname" ]; do
         [ -n "$pname" ] && process_names+=("$pname")
     done
 
+    # Gate ALL process-alive paths on the session actually being live in
+    # cmux. Without this, `pgrep -f node|claude` matches Cursor extensions,
+    # the Claude.app helpers, MCP servers, and so on — every non-existent
+    # session looks alive, which makes Gas City's reconciler report
+    # alive=true for ghost sessions. The result is either silent stuck-awake
+    # beads (pre-ju-ac49 Option 1 patch) or a rollback storm (post-patch).
+    # See jude ju-u015 for the trace and the symptom.
+    if ! _session_appears_live "$session_name"; then
+        echo "false"
+        exit 0
+    fi
+
     if [ ${#process_names[@]} -eq 0 ]; then
+        # Session is live and no process names to filter on — report alive.
         echo "true"
         exit 0
     fi
@@ -339,7 +444,7 @@ case "$op" in
     for pname in "${process_names[@]}"; do
         if pgrep -f "$pname" >/dev/null 2>&1; then
             found=true
-        break
+            break
         fi
     done
 
@@ -351,37 +456,55 @@ case "$op" in
     ;;
 
   nudge)
+    # Per spec: best-effort; exit 0 even if session doesn't exist.
     [ -z "$session_name" ] && exit 0
     msg=$(cat)
-    ws_key=$(_derive_workspace_key "$session_name")
-    ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
-    if [ -n "$ws_info" ]; then
-        ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
-        [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" "$msg\\n" 2>/dev/null || true
+    if _cmux_available; then
+        ws_key=$(_derive_workspace_key "$session_name")
+        ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
+        if [ -n "$ws_info" ]; then
+            ws_ref=$(echo "$ws_info" | jq -r '.ref // .uuid // empty')
+            [ -n "$ws_ref" ] && _cmux send --workspace "$ws_ref" "$msg\\n" 2>/dev/null || true
+        fi
     fi
+    exit 0
     ;;
 
   set-meta)
+    # File-only operation; does not require cmux.
     key="${1:?set-meta: missing key}"
+    [ -z "$session_name" ] && exit 1
     value=$(cat)
     echo -n "$value" > "$STATE_DIR/${session_name}.meta.${key}"
     ;;
 
   get-meta)
+    # File-only operation; does not require cmux.
     key="${1:?get-meta: missing key}"
+    [ -z "$session_name" ] && exit 0
     meta_file="$STATE_DIR/${session_name}.meta.${key}"
-    [ -f "$meta_file" ] && cat "$meta_file"
+    # Use an if/then block instead of `&&` so `set -e` doesn't propagate
+    # the "file missing" condition into a non-zero script exit.
+    if [ -f "$meta_file" ]; then
+        cat "$meta_file"
+    fi
     # Empty stdout = not set (per protocol).
     ;;
 
   remove-meta)
+    # File-only operation; does not require cmux.
     key="${1:?remove-meta: missing key}"
+    [ -z "$session_name" ] && exit 0
     rm -f "$STATE_DIR/${session_name}.meta.${key}"
     ;;
 
   peek)
     lines="${1:-0}"
     [ -z "$session_name" ] && exit 0
+    # peek requires cmux to read screen contents. Per spec, return empty
+    # on failure (peek's stdout is captured text; empty is a valid result).
+    _cmux_available || exit 0
+
     ws_key=$(_derive_workspace_key "$session_name")
     ws_info=$(_load_workspace_from_state "$ws_key") || ws_info=""
     [ -z "$ws_info" ] && exit 0
@@ -396,10 +519,13 @@ case "$op" in
     ;;
 
   list-running)
+    # Per spec: <prefix> is the second positional. After `shift 2`, the
+    # original $2 is in $session_name — repurpose it as the prefix filter.
     prefix="${session_name:-}"
-    json=$(_cmux list-workspaces --json 2>/dev/null) || {
-        exit 0
-    }
+    # Gracefully return empty if cmux is down — empty list is a valid result.
+    _cmux_available || exit 0
+
+    json=$(_cmux list-workspaces --json 2>/dev/null) || exit 0
     [ -z "$json" ] && exit 0
 
     echo "$json" | jq --arg prefix "$prefix" -r '(.workspaces // .) as $list |
@@ -413,20 +539,21 @@ case "$op" in
     ;;
 
   get-last-activity)
+    # Per spec: empty stdout = unsupported (maps to Go zero time).
     # CMUX does not expose per-workspace activity timestamps via CLI.
-    # Empty stdout = unsupported (per protocol).
     ;;
 
   copy-to)
+    # NOT part of the spec — provider-specific extension for copy_files support.
+    # Treated as a recognized op (exit 0) rather than exit 2 to avoid the
+    # reconciler classifying it as "unknown" if it ever invokes it.
     src="${1:-}"
     rel_dst="${2:-}"
     [ -z "$session_name" ] || [ -z "$src" ] && exit 0
 
-    ws_key=$(_derive_workspace_key "$session_name")
-    wrapper="$STATE_DIR/${session_name}.wrapper.sh"
+    wrapper=$(_wrapper_path "$session_name")
     work_dir=""
     if [ -f "$wrapper" ]; then
-        # Extract cd line:  cd "/path/to/dir"
         work_dir=$(grep '^cd ' "$wrapper" | head -1 | sed 's/^cd "//;s/"$//')
     fi
     [ -z "$work_dir" ] && exit 0
@@ -444,6 +571,7 @@ case "$op" in
     ;;
 
   *)
+    # Per spec: unknown operation → exit 2 (treated as forward-compatible no-op).
     exit 2
     ;;
 esac
