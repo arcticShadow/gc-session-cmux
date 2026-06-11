@@ -549,7 +549,7 @@ case "$op" in
     # reconciler classifying it as "unknown" if it ever invokes it.
     src="${1:-}"
     rel_dst="${2:-}"
-    [ -z "$session_name" ] || [ -z "$src" ] && exit 0
+    { [ -z "$session_name" ] || [ -z "$src" ]; } && exit 0
 
     wrapper=$(_wrapper_path "$session_name")
     work_dir=""
